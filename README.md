@@ -18,6 +18,7 @@
 - ✏️ **修改同步**：任意一方编辑修改已经发送的文本消息，对端展示内容会自动同步变更。
 
 ---
+```
 
 ## 🚀 部署指引
 
@@ -26,7 +27,6 @@
 git clone https://github.com/xxchou/tg-forward-bot.git
 cd tg-forward-bot
 pip install -r requirements.txt
-```
 
 ### 2. 获取所需凭证
 - **BOT_TOKEN**: 通过 Telegram 官方 [@BotFather](https://t.me/BotFather) 申请机器人获取。
