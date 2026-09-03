@@ -64,4 +64,8 @@ ADMIN_ID=你的Telegram数字ID
   ```bash
   systemctl daemon-reload
   systemctl enable --now tgbot
+
+  systemctl start tgbot     # 启动
+systemctl stop tgbot      # 停止
+systemctl restart tgbot   # 重启 (修改 bot.py 代码后执行)
   ```
