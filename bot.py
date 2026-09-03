@@ -1,230 +1,407 @@
-import asyncio
-import logging
 import os
 import re
-import html
-from typing import Optional
+import logging
+import asyncio
+from typing import Optional, List, Dict
 
-from dotenv import load_dotenv
-
-# 加载 .env 环境变量
-load_dotenv()
-
-from aiogram import Bot, Dispatcher, F
-from aiogram.enums import ParseMode
-from aiogram.filters import CommandStart, Command
-from aiogram.types import (
-    Message,
-    InlineKeyboardMarkup,
-    InlineKeyboardButton,
-    CallbackQuery
-)
-from aiogram.client.default import DefaultBotProperties
-from aiogram.fsm.storage.memory import MemoryStorage
 import aiosqlite
 from cachetools import TTLCache
-
-# ================= 配置与初始化 =================
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-ADMIN_ID_RAW = os.getenv("ADMIN_ID")
-
-if not BOT_TOKEN or not ADMIN_ID_RAW:
-    raise SystemExit("错误：未检测到 BOT_TOKEN 或 ADMIN_ID，请检查 .env 文件！")
-
-ADMIN_ID = int(ADMIN_ID_RAW)
-DB_PATH = "data/cards.db"
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    InputMediaPhoto,
+    InputMediaVideo,
+    InputMediaDocument,
+    InputMediaAudio,
+)
+from telegram.constants import ParseMode
+from telegram.ext import (
+    ApplicationBuilder,
+    CommandHandler,
+    MessageHandler,
+    CallbackQueryHandler,
+    ContextTypes,
+    filters,
+)
+from telegram.error import TelegramError
 
 logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+    format="%(asctime)s - [%(levelname)s] - %(name)s: %(message)s",
+    level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
-bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
-dp = Dispatcher(storage=MemoryStorage())
+BOT_TOKEN = os.getenv("BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
+ADMIN_ID = int(os.getenv("ADMIN_ID", "123456789"))
+DB_PATH = os.getenv("DB_PATH", "bot_database.db")
 
-# 防刷点击内存缓存：每位用户 2 秒内只能点一次翻页/交互按键
-click_cache = TTLCache(maxsize=10000, ttl=2.0)
+AD_KEYWORDS = [
+    r"usdt", r"博彩", r"兼职", r"代开发票", r"外汇", r"裸聊",
+    r"telegram.*channel", r"t\.me\/"
+]
+AD_REGEX = re.compile("|".join(AD_KEYWORDS), re.IGNORECASE)
 
-PAGE_SIZE = 5
+SESSION_MAP = TTLCache(maxsize=50000, ttl=48 * 3600)
+MEDIA_GROUP_CACHE: Dict[str, List[Update]] = {}
+MEDIA_LOCK = asyncio.Lock()
+REPLY_TARGET: Dict[int, int] = {}
 
-# ================= 数据库异步驱动 (WAL 模式) =================
-async def init_db():
-    """初始化数据库及表结构，开启高并发 WAL 模式"""
-    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("PRAGMA journal_mode=WAL;")
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS cards (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                card_number TEXT NOT NULL,
-                name TEXT NOT NULL,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+
+class Database:
+    @staticmethod
+    async def init():
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("PRAGMA journal_mode = WAL;")
+            await db.execute("PRAGMA synchronous = NORMAL;")
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS users (
+                    user_id INTEGER PRIMARY KEY,
+                    username TEXT,
+                    full_name TEXT,
+                    is_blocked INTEGER DEFAULT 0,
+                    is_verified INTEGER DEFAULT 0,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            await db.commit()
+
+    @staticmethod
+    async def get_user(user_id: int):
+        async with aiosqlite.connect(DB_PATH) as db:
+            async with db.execute(
+                "SELECT is_blocked, is_verified FROM users WHERE user_id = ?", (user_id,)
+            ) as cursor:
+                row = await cursor.fetchone()
+                if row:
+                    return {"blocked": bool(row[0]), "verified": bool(row[1])}
+                return {"blocked": False, "verified": False}
+
+    @staticmethod
+    async def upsert_user(user_id: int, username: str, full_name: str, is_verified: Optional[bool] = None):
+        async with aiosqlite.connect(DB_PATH) as db:
+            if is_verified is None:
+                await db.execute("""
+                    INSERT INTO users (user_id, username, full_name)
+                    VALUES (?, ?, ?)
+                    ON CONFLICT(user_id) DO UPDATE SET
+                        username = excluded.username,
+                        full_name = excluded.full_name,
+                        updated_at = CURRENT_TIMESTAMP
+                """, (user_id, username, full_name))
+            else:
+                await db.execute("""
+                    INSERT INTO users (user_id, username, full_name, is_verified)
+                    VALUES (?, ?, ?, ?)
+                    ON CONFLICT(user_id) DO UPDATE SET
+                        username = excluded.username,
+                        full_name = excluded.full_name,
+                        is_verified = excluded.is_verified,
+                        updated_at = CURRENT_TIMESTAMP
+                """, (user_id, username, full_name, 1 if is_verified else 0))
+            await db.commit()
+
+    @staticmethod
+    async def set_blocked(user_id: int, blocked: bool):
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute(
+                "UPDATE users SET is_blocked = ? WHERE user_id = ?",
+                (1 if blocked else 0, user_id)
             )
-        """)
-        await db.execute("CREATE INDEX IF NOT EXISTS idx_cards_number ON cards(card_number);")
-        await db.commit()
-    logger.info("数据库初始化完成 (WAL 模式已就绪)")
+            await db.commit()
 
-async def db_add_cards(cards: list[tuple[str, str]]) -> int:
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.executemany(
-            "INSERT INTO cards (card_number, name) VALUES (?, ?)",
-            cards
-        )
-        await db.commit()
-        return len(cards)
 
-async def db_search_count(keyword: str) -> int:
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute(
-            "SELECT COUNT(*) FROM cards WHERE card_number LIKE ? OR name LIKE ?",
-            (f"%{keyword}%", f"%{keyword}%")
-        ) as cursor:
-            row = await cursor.fetchone()
-            return row[0] if row else 0
+def check_is_ad(text: Optional[str]) -> bool:
+    if not text:
+        return False
+    return bool(AD_REGEX.search(text))
 
-async def db_search_paged(keyword: str, page: int, page_size: int = PAGE_SIZE) -> list[tuple]:
-    offset = (page - 1) * page_size
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute(
-            "SELECT card_number, name FROM cards WHERE card_number LIKE ? OR name LIKE ? ORDER BY id DESC LIMIT ? OFFSET ?",
-            (f"%{keyword}%", f"%{keyword}%", page_size, offset)
-        ) as cursor:
-            return await cursor.fetchall()
 
-# ================= 辅助函数 =================
-def sanitize_input(text: str) -> str:
-    cleaned = re.sub(r"[\x00-\x1f\x7f-\x9f]", "", text)
-    return cleaned.strip()
-
-def build_pagination_keyboard(keyword: str, current_page: int, total_pages: int) -> Optional[InlineKeyboardMarkup]:
-    if total_pages <= 1:
-        return None
-    buttons = []
-    if current_page > 1:
-        buttons.append(InlineKeyboardButton(text="⬅️ 上一页", callback_data=f"page:{keyword}:{current_page - 1}"))
-    buttons.append(InlineKeyboardButton(text=f"📄 {current_page}/{total_pages}", callback_data="noop"))
-    if current_page < total_pages:
-        buttons.append(InlineKeyboardButton(text="下一页 ➡️", callback_data=f"page:{keyword}:{current_page + 1}"))
-    return InlineKeyboardMarkup(inline_keyboard=[buttons])
-
-# ================= 业务路由处理 =================
-@dp.message(CommandStart())
-async def cmd_start(message: Message):
-    welcome_text = (
-        "👋 <b>欢迎使用卡密/数据查询机器人！</b>\n\n"
-        "🔍 <b>查询方式：</b> 直接向我发送关键词（卡号或名称）即可。\n"
+def build_header(user) -> str:
+    return (
+        f"📩 <a href=\"tg://user?id={user.id}\">{user.full_name}</a>"
+        f" (<code>{user.id}</code>)：\n\n"
     )
-    if message.from_user.id == ADMIN_ID:
-        welcome_text += (
-            "\n⚙️ <b>管理员指令：</b>\n"
-            "• 批量导入卡密：<code>/add 卡号1----卡名1 卡号2 卡名2</code>\n"
-            "  <i>(支持换行、空格、制表符、四连短横线等分隔符)</i>"
+
+
+async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if user.id == ADMIN_ID:
+        await update.message.reply_text("👑 管理员您好！点击【回复】按钮后直接发消息即可。")
+        return
+
+    u_info = await Database.get_user(user.id)
+    if u_info["blocked"]:
+        return
+
+    await Database.upsert_user(user.id, user.username or "", user.full_name)
+    if not u_info["verified"]:
+        kb = [[InlineKeyboardButton("✅ 点击完成验证", callback_data=f"verify_{user.id}")]]
+        await update.message.reply_text(
+            f"你好，{user.first_name}！\n请点击下方按钮完成验证：",
+            reply_markup=InlineKeyboardMarkup(kb)
         )
-    await message.answer(welcome_text)
+    else:
+        await update.message.reply_text("你好！直接发消息即可，我们会尽快回复。")
 
-@dp.message(Command("add"))
-async def cmd_add_cards(message: Message):
-    if message.from_user.id != ADMIN_ID:
+
+async def verify_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    target_user_id = int(query.data.split("_")[1])
+    if query.from_user.id != target_user_id:
+        await query.answer("这不是给你的验证按钮！", show_alert=True)
+        return
+    await query.answer("验证通过！")
+    await Database.upsert_user(
+        query.from_user.id,
+        query.from_user.username or "",
+        query.from_user.full_name,
+        is_verified=True
+    )
+    await query.edit_message_text("🎉 验证成功！现在可以直接发送消息了。")
+
+
+async def reply_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if query.from_user.id != ADMIN_ID:
+        await query.answer("无权限", show_alert=True)
         return
 
-    content = message.text[len("/add"):].strip()
-    if not content:
-        await message.answer("⚠️ 请在 <code>/add</code> 后附带需要导入的内容！\n格式示例：<code>卡号----名称</code> 或 <code>卡号 名称</code>")
+    target_user_id = int(query.data.split("_")[1])
+    REPLY_TARGET[ADMIN_ID] = target_user_id
+    # 只弹一个小提示，不发消息
+    await query.answer(f"已锁定用户 {target_user_id}，直接发消息即可")
+
+
+async def handle_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    msg = update.effective_message
+
+    if user.id == ADMIN_ID:
         return
 
-    lines = content.splitlines()
-    cards_to_insert = []
-
-    for line in lines:
-        line = sanitize_input(line)
-        if not line:
-            continue
-        parts = re.split(r"----+|\t+|\s{2,}|\s+", line)
-        parts = [p.strip() for p in parts if p.strip()]
-
-        if len(parts) >= 2:
-            card_num = parts[0]
-            name = " ".join(parts[1:])
-            cards_to_insert.append((card_num, name))
-        elif len(parts) == 1:
-            cards_to_insert.append((parts[0], "未命名"))
-
-    if not cards_to_insert:
-        await message.answer("⚠️ 未识别到有效数据，请检查格式。")
+    u_info = await Database.get_user(user.id)
+    if u_info["blocked"]:
         return
 
-    added_count = await db_add_cards(cards_to_insert)
-    await message.answer(f"✅ 成功录入 <b>{added_count}</b> 条数据！")
-
-@dp.message(F.text)
-async def handle_search(message: Message):
-    keyword = sanitize_input(message.text)
-    if not keyword or keyword.startswith("/"):
+    if not u_info["verified"]:
+        kb = [[InlineKeyboardButton("✅ 点击完成验证", callback_data=f"verify_{user.id}")]]
+        await msg.reply_text("请先完成验证：", reply_markup=InlineKeyboardMarkup(kb))
         return
 
-    total_count = await db_search_count(keyword)
-    if total_count == 0:
-        safe_kw = html.escape(keyword)
-        await message.answer(f"🔍 未查询到包含 <code>{safe_kw}</code> 的相关记录。")
+    content_text = msg.text or msg.caption or ""
+    if check_is_ad(content_text):
+        await msg.reply_text("您的消息包含敏感词汇，未能发送。")
         return
 
-    total_pages = (total_count + PAGE_SIZE - 1) // PAGE_SIZE
-    records = await db_search_paged(keyword, page=1)
-
-    response = [f"🔎 查询：<code>{html.escape(keyword)}</code> (共 {total_count} 条)"]
-    response.append("━━━━━━━━━━━━━━━━━━")
-    for num, name in records:
-        response.append(f"💳 卡号: <code>{html.escape(num)}</code>\n🏷️ 名称: {html.escape(name)}\n")
-
-    keyboard = build_pagination_keyboard(keyword, current_page=1, total_pages=total_pages)
-    await message.answer("\n".join(response), reply_markup=keyboard)
-
-@dp.callback_query(F.data.startswith("page:"))
-async def handle_pagination(callback: CallbackQuery):
-    user_id = callback.from_user.id
-    if user_id in click_cache:
-        await callback.answer("⏳ 点击太快了，请慢一点~", show_alert=False)
+    if msg.media_group_id:
+        async with MEDIA_LOCK:
+            if msg.media_group_id not in MEDIA_GROUP_CACHE:
+                MEDIA_GROUP_CACHE[msg.media_group_id] = []
+                asyncio.create_task(
+                    dispatch_media_group_to_admin(msg.media_group_id, user.id, context)
+                )
+            MEDIA_GROUP_CACHE[msg.media_group_id].append(update)
         return
-    click_cache[user_id] = True
-
-    _, keyword, target_page_str = callback.data.split(":")
-    page = int(target_page_str)
-
-    total_count = await db_search_count(keyword)
-    total_pages = (total_count + PAGE_SIZE - 1) // PAGE_SIZE
-
-    if page < 1 or page > total_pages:
-        await callback.answer("页面不存在")
-        return
-
-    records = await db_search_paged(keyword, page=page)
-    response = [f"🔎 查询：<code>{html.escape(keyword)}</code> (共 {total_count} 条)"]
-    response.append("━━━━━━━━━━━━━━━━━━")
-    for num, name in records:
-        response.append(f"💳 卡号: <code>{html.escape(num)}</code>\n🏷️ 名称: {html.escape(name)}\n")
-
-    keyboard = build_pagination_keyboard(keyword, current_page=page, total_pages=total_pages)
 
     try:
-        await callback.message.edit_text("\n".join(response), reply_markup=keyboard)
-    except Exception:
-        pass
-    await callback.answer()
+        header = build_header(user)
+        reply_kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("💬 回复", callback_data=f"reply_{user.id}")]
+        ])
 
-@dp.callback_query(F.data == "noop")
-async def handle_noop(callback: CallbackQuery):
-    await callback.answer()
+        if msg.text:
+            fwd_msg = await context.bot.send_message(
+                chat_id=ADMIN_ID,
+                text=header + msg.text_html,
+                parse_mode=ParseMode.HTML,
+                reply_markup=reply_kb
+            )
+        elif msg.sticker:
+            fwd_msg = await msg.forward(chat_id=ADMIN_ID)
+            # 贴纸无法加按钮，单独发一条带按钮的
+            await context.bot.send_message(
+                chat_id=ADMIN_ID,
+                text=header.strip(),
+                parse_mode=ParseMode.HTML,
+                reply_markup=reply_kb
+            )
+        else:
+            original_caption = msg.caption_html or ""
+            new_caption = header + original_caption
+            fwd_msg = await context.bot.copy_message(
+                chat_id=ADMIN_ID,
+                from_chat_id=msg.chat_id,
+                message_id=msg.message_id,
+                caption=new_caption,
+                parse_mode=ParseMode.HTML,
+                reply_markup=reply_kb
+            )
 
-# ================= 程序入口 =================
-async def main():
-    await init_db()
-    logger.info("Bot 服务已就绪，开始 Polling 轮询...")
-    await dp.start_polling(bot)
+        SESSION_MAP[f"admin_{fwd_msg.message_id}"] = (user.id, msg.message_id)
+        logger.info(f"用户 {user.id} 消息已转发给管理员")
+
+    except TelegramError as e:
+        logger.error(f"转发失败: {e}")
+
+
+async def dispatch_media_group_to_admin(mg_id: str, user_id: int, context: ContextTypes.DEFAULT_TYPE):
+    await asyncio.sleep(0.8)
+    async with MEDIA_LOCK:
+        updates = MEDIA_GROUP_CACHE.pop(mg_id, [])
+
+    if not updates:
+        return
+
+    first_msg = updates[0].effective_message
+    user = updates[0].effective_user
+    header = build_header(user)
+
+    media_batch = []
+    for idx, u in enumerate(updates):
+        m = u.effective_message
+        caption = (header + (m.caption_html or "")) if idx == 0 else (m.caption_html if m.caption else None)
+        parse = ParseMode.HTML
+        if m.photo:
+            media_batch.append(InputMediaPhoto(media=m.photo[-1].file_id, caption=caption, parse_mode=parse))
+        elif m.video:
+            media_batch.append(InputMediaVideo(media=m.video.file_id, caption=caption, parse_mode=parse))
+        elif m.document:
+            media_batch.append(InputMediaDocument(media=m.document.file_id, caption=caption, parse_mode=parse))
+        elif m.audio:
+            media_batch.append(InputMediaAudio(media=m.audio.file_id, caption=caption, parse_mode=parse))
+
+    try:
+        sent_msgs = await context.bot.send_media_group(chat_id=ADMIN_ID, media=media_batch)
+        SESSION_MAP[f"admin_{sent_msgs[0].message_id}"] = (user.id, first_msg.message_id)
+
+        reply_kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("💬 回复", callback_data=f"reply_{user.id}")]
+        ])
+        await context.bot.send_message(
+            chat_id=ADMIN_ID,
+            text=f"⬆️ 来自 <code>{user.id}</code> 的相册",
+            parse_mode=ParseMode.HTML,
+            reply_markup=reply_kb
+        )
+    except TelegramError as e:
+        logger.error(f"相册转发失败: {e}")
+
+
+async def handle_admin_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.effective_message
+    if update.effective_user.id != ADMIN_ID:
+        return
+
+    # 方式一：长按回复
+    if msg.reply_to_message:
+        target_info = SESSION_MAP.get(f"admin_{msg.reply_to_message.message_id}")
+        if target_info:
+            await send_to_user(context, msg, target_info[0], target_info[1])
+            return
+
+    # 方式二：点击按钮锁定后直接发
+    target_user_id = REPLY_TARGET.get(ADMIN_ID)
+    if target_user_id:
+        await send_to_user(context, msg, target_user_id, None)
+        return
+
+
+async def send_to_user(context, admin_msg, target_user_id: int, reply_to_msg_id: Optional[int]):
+    try:
+        if reply_to_msg_id:
+            try:
+                await context.bot.copy_message(
+                    chat_id=target_user_id,
+                    from_chat_id=ADMIN_ID,
+                    message_id=admin_msg.message_id,
+                    reply_to_message_id=reply_to_msg_id
+                )
+            except TelegramError:
+                await context.bot.copy_message(
+                    chat_id=target_user_id,
+                    from_chat_id=ADMIN_ID,
+                    message_id=admin_msg.message_id
+                )
+        else:
+            await context.bot.copy_message(
+                chat_id=target_user_id,
+                from_chat_id=ADMIN_ID,
+                message_id=admin_msg.message_id
+            )
+        logger.info(f"✅ 回复已送达用户 {target_user_id}")
+    except TelegramError as e:
+        logger.error(f"发送失败: {e}")
+        await admin_msg.reply_text(f"❌ 发送失败：{e.message}")
+
+
+async def block_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        return
+    msg = update.effective_message
+    target_user_id = None
+
+    if msg.reply_to_message:
+        info = SESSION_MAP.get(f"admin_{msg.reply_to_message.message_id}")
+        if info:
+            target_user_id = info[0]
+    if not target_user_id and context.args:
+        try:
+            target_user_id = int(context.args[0])
+        except ValueError:
+            pass
+    if not target_user_id:
+        target_user_id = REPLY_TARGET.get(ADMIN_ID)
+
+    if not target_user_id:
+        await msg.reply_text("用法：/block <用户ID> 或回复用户消息")
+        return
+
+    await Database.set_blocked(target_user_id, blocked=True)
+    await msg.reply_text(f"🚫 用户 <code>{target_user_id}</code> 已拉黑。", parse_mode=ParseMode.HTML)
+
+
+async def unblock_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        return
+    if not context.args:
+        await update.effective_message.reply_text("用法：/unblock <用户ID>")
+        return
+    try:
+        uid = int(context.args[0])
+        await Database.set_blocked(uid, blocked=False)
+        await update.effective_message.reply_text(f"✅ 用户 <code>{uid}</code> 已解封。", parse_mode=ParseMode.HTML)
+    except ValueError:
+        await update.effective_message.reply_text("请输入合法的用户ID。")
+
+
+async def on_startup(app):
+    await Database.init()
+
+
+def main():
+    if BOT_TOKEN == "YOUR_BOT_TOKEN_HERE":
+        print("请先设置 BOT_TOKEN")
+        return
+
+    app = ApplicationBuilder().token(BOT_TOKEN).post_init(on_startup).build()
+
+    app.add_handler(CommandHandler("start", start_cmd))
+    app.add_handler(CommandHandler("block", block_cmd))
+    app.add_handler(CommandHandler("unblock", unblock_cmd))
+    app.add_handler(CallbackQueryHandler(verify_callback, pattern=r"^verify_\d+"))
+    app.add_handler(CallbackQueryHandler(reply_callback, pattern=r"^reply_\d+"))
+
+    app.add_handler(MessageHandler(
+        filters.Chat(ADMIN_ID) & ~filters.COMMAND, handle_admin_message
+    ))
+    app.add_handler(MessageHandler(
+        filters.ChatType.PRIVATE & ~filters.Chat(ADMIN_ID) & ~filters.COMMAND, handle_user_message
+    ))
+
+    logger.info("Bot 已启动")
+    app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
+
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except (KeyboardInterrupt, SystemExit):
-        logger.info("Bot 服务已安全停止。")
+    main()
