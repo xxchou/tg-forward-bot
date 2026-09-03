@@ -1,63 +1,67 @@
 # 🤖 Telegram 智能客服与消息转接机器人
 
-```markdown
+# Telegram 卡密 / 数据管理机器人
 
-基于 `python-telegram-bot (v20+)` 打造的高性能客服转发机器人，专为个人或团队对外联络设计。
+基于 Python 3.10+、aiogram v3 与 aiosqlite 构建的高性能 Telegram 检索机器人。
 
-## ✨ 特性
+## 🌟 特性
+- 异步高并发架构，SQLite 默认启用 WAL 模式，防止数据库死锁
+- 极速检索，支持卡号、名称双向模糊查询
+- 内置分页展示，配备内存防抖（防高频连击刷屏）
+- 支持复杂分隔符批量导入 (`----`、空格、Tab、多空格等)
+- 严格遵循 PEP 668 环境隔离与 `.env` 敏感配置分离
 
-- 💬 **全消息类型支持**：完美支持纯文本、多图合并相册（Media Group）、语音、圆视频、各种格式文件、表情等。
-- ⚡ **无感交互**：
-  - **直接引用回复**：管理员只需在 Telegram 里对某条消息点击“引用回复”，对端用户即可无缝收到消息。
-  - **极速双向撤回**：管理员引用消息回复 `.`、`del`、`d` 或 `撤`，机器人会自动同时从双方聊天记录中彻底删除该消息（支持多图相册一键全删）。
-  - **锁定单人对话**：点击消息下方的「锁定此人对话」，后续无需频繁引用即可连续向该用户发消息。
-- 🛡️ **安全与风控**：
-  - **动态数学算术验证**：未验证的新用户需先点击回答算术题，防止脚本机器人爆破刷屏。
-  - **实时云端骗子库联动**：自动同步黑名单库，遇到恶意号进线会显示醒目的 `⚠️ [骗子名单]` 标签。
-  - **广告违规过滤**：命中常见赌博、刷单、违规引流关键词，自动拦截并一键拉黑。
-- ✏️ **修改同步**：任意一方编辑修改已经发送的文本消息，对端展示内容会自动同步变更。
+## 🚀 部署指南
 
----
+### 1. 克隆项目并创建虚拟环境
+```bash
+git clone <你的仓库地址>
+cd tg-bot
+python3 -m venv venv
 ```
 
-## 🚀 部署指引
-
-### 1. 准备环境与拉取代码
+### 2. 安装依赖
 ```bash
-git clone https://github.com/xxchou/tg-forward-bot.git
-cd tg-forward-bot
-pip install -r requirements.txt
-
-### 2. 获取所需凭证
-- **BOT_TOKEN**: 通过 Telegram 官方 [@BotFather](https://t.me/BotFather) 申请机器人获取。
-- **ADMIN_CHAT_ID**: 你的 Telegram 纯数字账号 ID（可通过联系 [@userinfobot](https://t.me/userinfobot) 查看）。
-
-### 3. 运行机器人
-
-#### 方式 A：临时调试（直接传入环境变量）
-```bash
-BOT_TOKEN="你的Token" ADMIN_CHAT_ID=你的数字ID python bot.py
+./venv/bin/pip install -r requirements.txt
 ```
 
-#### 方式 B：使用 PM2 常驻后台（推荐）
+### 3. 配置环境变量
+复制模板文件：
 ```bash
-# 安装 PM2（如未安装）
-npm install pm2 -g
-
-# 启动并持久化
-BOT_TOKEN="你的Token" ADMIN_CHAT_ID=你的数字ID pm2 start bot.py --name "tg-forward-bot" --interpreter python3
-pm2 save
-pm2 startup
+cp config.example.env .env
+```
+编辑 `.env` 填入真实凭证：
+```env
+BOT_TOKEN=你的BotToken
+ADMIN_ID=你的Telegram数字ID
 ```
 
----
+### 4. 运行
+- **前台测试运行：**
+  ```bash
+  ./venv/bin/python bot.py
+  ```
 
-## 📖 管理员指令
+- **后台持久化运行 (推荐 systemd)：**
+  创建服务文件 `/etc/systemd/system/tgbot.service`：
+  ```ini
+  [Unit]
+  Description=Telegram Bot Service
+  After=network.target
 
-| 指令 | 说明 |
-| :--- | :--- |
-| `/start` | 查看快捷控制面板与指令说明 |
-| `/unselect` | 解除当前锁定的用户会话 |
-| `/ban <ID>` | 封禁指定的用户数字 ID |
-| `/unban <ID>` | 解除封禁指定的用户数字 ID |
-| `/stats` | 查看当前系统的用户总数与黑名单概况 |
+  [Service]
+  Type=simple
+  User=root
+  WorkingDirectory=/root/tg-bot
+  ExecStart=/root/tg-bot/venv/bin/python /root/tg-bot/bot.py
+  Restart=always
+  RestartSec=5
+
+  [Install]
+  WantedBy=multi-user.target
+  ```
+  加载并启动：
+  ```bash
+  systemctl daemon-reload
+  systemctl enable --now tgbot
+  ```
